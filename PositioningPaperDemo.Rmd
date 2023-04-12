@@ -1,0 +1,427 @@
+---
+title: "Heim et al. 2023 - Using recovered radio transmitters to estimate positioning
+  error and a generalized Monte Carlo simulation to incorporate error into animal
+  telemetry analysis "
+author: "Kurt C. Heim"
+date: "2023-03-06"
+output:
+  html_document: default
+  word_document: default
+---
+
+This R script provides demonstrations of the methods presented in Heim et al. (2023) published in Animal Biotelemetry.
+
+Contact info: Kurt Heim , kurtcheim@gmail.com 
+
+To run this you need:
+
+"PositioningPaperDemo.Rmd" (this document)
+
+"FunctionsHeim2023V2.R" Collection of functions used
+
+"RSS_Model_Data.csv" Data to build RSS vs. Distance model
+
+"FishMoveDataset.csv" Example fish movement dataset
+
+"NHDFlowline selection_1.shp" River shapefile for river distance calculations
+
+## Load dataset for building RSS model
+
+The following brings in a dataset that is used to build a received signal strength (RSS) model. This is a model that uses RSS (or Power or decibels) to predict distance-to-transmitter. See Heim et al. 2018 for further details on building RSS models.  
+
+A good fitting RSS model can be used to convert RSS to predictions of positioning error, for field-based radio telemetry detentions, when the 'homing' method is used. Homing generally means you wander around until you find an RSS peak, then you record the estimated fish location at the spot where you found the RSS peak. This can be done from a boat, on foot, an airplane, or a stand up paddle board. Because RSS increases in a predictable manner as one approaches a transmitter with a receiver -- the RSS model (which essentially converts RSS to distance) lets you know how far you probably were when you made the estimate. 
+
+I had the idea to do this because my avalanche beacon does this. Rather than provide me with a unitless measure of RSS (which would not help me to quickly find someone stuck in the snow!), my beacon tells me 'how far it is' from the transmitting beacon. Radio telemetry receivers used to track fish underwater can provide similar information after calibrating an RSS model.   
+
+This can be run on any data that has (1) RSS values and (2) the distance that the receiver was from the transmitter when the detection was made. In this example we use the dataset developed in Heim et al. 2023 where the calibration dataset is made from repeatedly tracked transmitters that were eventually recovered at a known location. They were tracked many times by staff (who did not know they were dead fish), at each time making an estimate of fish position using homing. After we recovered these transmitters, we had a known location by which to assess the accuracy of all prior detections. See manuscript for details.  
+
+```{r}
+#load the functions required to run this markdown file
+setwd("C:/Users/kheim/OneDrive - DOI/Manuscripts/DeadFish_Signal Strength Model/Final Data and Code For Sharing")
+source("FunctionsHeim2023V2.R")
+#Load the data
+dat<-read.csv("RSS_Model_Data.csv", header = TRUE)
+```
+
+## Build an RSS model with the Yagi Antenna
+
+Here we used several approaches to develop the best model for the Yagi dataset. Several candidate models are run and then the top model is selected using AIC. Results are then plotted to review the fit of the top model. 
+
+```{r, echo = TRUE}
+#####Yagi Model######
+yag<-dat[dat$Antenna == "Yagi",]
+yag<-yag[is.na(yag$Distance) == FALSE,]
+yag[yag$Distance == 0,"Distance"]<-1# zeros cant be log transformed -- so change to 1
+
+###Run six different models
+M1_linear<-lm(Distance ~ Power, yag)
+M2_log<-lm(log(Distance) ~ Power, yag)
+M3_loglog<-lm(log(Distance) ~ log(Power), yag)
+M4_poly<-lm(Distance ~ poly(Power, 2), yag)
+M5_logPoly<-lm(log(Distance) ~ poly(Power, 2) , yag)
+
+
+myAIC<-AIC(M1_linear, M2_log, M3_loglog, M4_poly, M5_logPoly)
+myAIC[order(myAIC$AIC),]
+summary(M5_logPoly)
+
+
+#M5_logPoly is the best
+#plot result
+newdat<-data.frame(Power = seq(0, 207, 1))
+preds<-data.frame(predict(M5_logPoly, newdat, interval = "prediction", level = 0.8))
+
+plot( yag$Power, yag$Distance, ylab = "Distance (m)", xlab = "RSS")
+lines(newdat$Power, exp(preds$fit))
+lines(newdat$Power, exp(preds$upr))
+lines(newdat$Power, exp(preds$lwr))
+
+#save top model with easier to type name for using later
+YagiMod<-M5_logPoly
+```
+
+## Build an RSS model with the Whip antenna data. 
+
+Show same process for the Whip antenna. The same model form (log(distance) + poly(RSS, 2)) is the best. 
+```{r, echo = TRUE}
+#####Whip model
+whip<-dat[dat$Antenna == "Whip",]
+nrow(whip)
+whip<-whip[is.na(whip$Distance) == FALSE,]
+whip[whip$Distance == 0,"Distance"]<-1# zeros dont work so change to 1
+
+#Remove two outliers that are overly influential in model
+whip<-whip[whip$Power < 160,]
+whip<-whip[whip$Distance > 0.01,]
+
+###Run six different models
+M1_linear<-lm(Distance ~ Power, whip)
+M2_log<-lm(log(Distance) ~ Power,whip)
+M3_loglog<-lm(log(Distance) ~ log(Power), whip)
+M4_poly<-lm(Distance ~ poly(Power, 2), whip)
+M5_logPoly<-lm(log(Distance) ~ poly(Power, 2) , whip)
+
+
+myAIC<-AIC(M1_linear, M2_log, M3_loglog, M4_poly, M5_logPoly)
+myAIC[order(myAIC$AIC),]
+summary(M5_logPoly)
+
+
+#M5_logPoly is the best
+#plot result
+newdat<-data.frame(Power = seq(0, 207, 1))
+preds<-data.frame(predict(M5_logPoly, newdat, interval = "prediction", level = 0.8))
+
+plot( whip$Power, whip$Distance, ylab = "Distance (m)", xlab = "RSS")
+lines(newdat$Power, exp(preds$fit))
+lines(newdat$Power, exp(preds$upr))
+lines(newdat$Power, exp(preds$lwr))
+
+#save top model with easier to type name
+WhipMod<-M5_logPoly
+```
+
+
+## Bring in river data
+Subsequent demonstrations will require a river network. Use several packages to bring this shape file into R. 
+
+```{r, echo = TRUE, warning = FALSE, message = FALSE}
+#load river network
+library(rgdal)
+library(riverdist)
+library(sf)
+setwd("C:/Users/kheim/OneDrive - DOI/Manuscripts/DeadFish_Signal Strength Model/Data/GIS")
+mysp<-readOGR(dsn = "C:/Users/kheim/OneDrive - DOI/Manuscripts/DeadFish_Signal Strength Model/Data/GIS",
+              layer = "NHDFlowline selection_1")
+
+myCRS<-mysp@proj4string#This saves the project CRS which is UTM , need for later
+
+riv<-line2network(mysp) #save as river network file
+riv<-dissolve(riv) # dissolve so it has fewer segments
+plot(riv) # look at it
+riv<-setmouth(seg = 2, vert = 1308, riv) #set the river mouth
+riv<-addverts(riv, mindist = 10) #add vertices so none are more than 10 m apart along the river
+```
+
+
+
+## Demostrate the moveSimp methods to determine spatial overlap
+
+moveSimp is a 2 dimensional function that asks 'do these two polygons overlap?'. Each polygon represents a spatial confidence area associated with a telemetry detection. If the two spatial confidence intervals do not overlap, then you can be pretty sure the fish moved! For each of two points, a buffer is drawn around the point with radius *r* . *r* is 'how far away you probably were from the transmitter' and is defined by the RSS, the RSS model, and a prediction level. The prediction level (i.e. , 0.8, 0.9, 0.95) guides the radius size drawn. More confidence that the 'true fish location' lies within the buffer is achieved by higher prediction levels, for example with 0.95 we are 95% sure that the true location is within the buffered area. For lower confidence levels the size of buffers will be smaller (i.e., if level =0.50 then there is a 50% chance the true location lies within the buffer). 
+
+The choice of which upper prediction level to use, or whether to simply use the model prediction values (i.e. Heim et al. 2023, Figure 2) is guided by research questions being asked. 
+
+This function takes two location estimates, draws buffers, and then asks if they are overlapping or not. It produced results for movement (YES/NO) for the specified upper prediction interval. It also uses the RSS model prediction to do the same test for movement (YES/NO). The straight line distance between points is also reported.
+
+Bring in the example fish movement dataset and convert all points to UTM
+
+```{r}
+fish<-read.csv("FishMoveDataset.csv", header = TRUE)
+fish<-fish[!is.na(fish$Power),]#cant use em if they have no RSS
+projcrs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"#Coordinate system of the fish points
+df<-st_as_sf(x = fish,
+             coords = c("DetLong", "DetLat"),
+             crs = projcrs)
+df<-st_transform(df, myCRS)
+myCoords<-st_coordinates(df)
+df$UTM_X<-myCoords[,1]
+df$UTM_Y<-myCoords[,2]
+plot(df$UTM_X, df$UTM_Y, ylab = "UTM Y", xlab = "UTM X")
+```
+
+## Demonstrate moveSimp function
+
+This function takes inputs
+
+**pt1** The first point of the fish in the fish dataframe
+
+**pt2** The second point of the fish in the fish dataframe
+
+**RSS1** The RSS associated with first detection
+
+**RSS2** The RSS associated with the second detection
+
+**ANT1** Antenna type used for first detection
+
+**ANT2** Antenna type used for second detection
+
+**YagiMod** The RSS model for the yagi antenna
+
+**WhipMod** the RSS model for the whip antenna
+
+**mylev** Level used for prediction (i.e., alpha)
+
+**exp_predictions** Should the predictions be exponentiated (use when the RSS model makes predictions on log transformed distance)
+
+Output of the function is a data frame with first column of distance between points, and second column whether or not it moved (according to overlap of the polygons supplied and mylev), and whether polygons overlap when using the model prediction for r
+
+```{r}
+##Did fish move between point 1 and point 2?
+moveSimp(pt1 = df[1,],
+         pt2 = df[2,], 
+         RSS1 = df$Power[1],
+         RSS2 = df$Power[2],
+         ANT1 =df$Antenna[1],
+         ANT2 = df$Antenna[2],
+         YagiMod = YagiMod,
+         WhipMod = WhipMod,
+         mylev = 0.8, 
+         exp_predictions = TRUE)
+
+## Did fish move between point 2 and 3
+moveSimp(pt1 = df[2,],
+         pt2 = df[3,], 
+         RSS1 = df$Power[2],
+         RSS2 = df$Power[3], 
+         ANT1 =df$Antenna[2],
+         ANT2 = df$Antenna[3],
+         YagiMod = YagiMod,
+         WhipMod = WhipMod,
+         mylev = 0.8, 
+         exp_predictions = TRUE)
+```
+
+
+
+## Loop it and do for all consecutive points in this data frame
+
+Here is how you could do it for all consecutive points for a fish by using the moveSimp function and a for loop.
+
+```{r, message = FALSE}
+#Do the first pair 
+MyResult<-moveSimp(pt1 = df[1,],
+         pt2 = df[2,], 
+         RSS1 = df$Power[1],
+         RSS2 = df$Power[2], 
+          ANT1 =df$Antenna[2],
+         ANT2 = df$Antenna[3],
+          YagiMod = YagiMod,
+         WhipMod = WhipMod,
+         mylev = 0.8, 
+         exp_predictions = TRUE)
+#Do the rest of the pairs and rbind each to grow the final result dataframe
+for(i in 2: (nrow(df)-1)){
+  SecondSet<-moveSimp(pt1 = df[i,],
+         pt2 = df[i+1,], 
+         RSS1 = df$Power[i],
+         RSS2 = df$Power[i+1],
+          ANT1 =df$Antenna[i],
+          ANT2 = df$Antenna[i+1],
+          YagiMod = YagiMod,
+         WhipMod = WhipMod,
+         mylev = 0.8, 
+         exp_predictions = TRUE)
+ MyResult<-rbind(MyResult, SecondSet)
+}
+MyResult
+```
+
+
+
+## The MC approach demostrated
+
+The next approach *Incorporating telemetry error into analysis: Monte Carlo simulation* (see Heim 2023) approaches the question of 'did it move' from a re sampling perspective using monte carlo simulation. This method also assumes the fish is in the river and 'snaps' points to a river network. It is implemented using several functions.  
+
+The first function is used to 'sample' a possible fish location given an estimated location, an RSS value, and an RSS model. This samples a predicted distance at the given RSS value based on the models. For example, if RSS is 100 and we view our model (Figure 5 in Heim et al. 2023), the then residuals form a normal distribution around the prediction line. We can 'sample' from this distribution, so most often the sampled values will be close to the line, less often the will be quite far away. Also, this function samples an angle to use to compute a new set of coordiantes (0 - 360). This is done because we make no assumptions about directionality of the transmitter from the receiver. 
+
+
+## Demostrate the function to sample new points
+
+If you have an estimated location (X,Y) and the maximum RSS achieved when estimating this location, then trigonometry can be used to make educated guess as to 'possible' locations the transmitter could have been. See figure S1 in Heim et al. 2023 for math involved.
+
+If RSS is higher then you are closer to the actual transmitter, and your simulated points will be closeer to your estimated point. In contrast, if your RSS is low then your simulated points will be quite far from you. The inputs to this function are: 
+
+**X** = the UTM X coordinate of the recorded location
+
+**Y** = the UTM Y coordinate of the recorded location
+
+**YagiMod** = the RSS model (fit in previous step) for Yagi
+
+**WhipMod** = the RSS model (fit in previous step) for whip antenna
+
+**ANT** = the antenna type used for this detection
+
+**RSS** = the observed RSS value associated with X and Y of the recorded location
+
+**maxR** = a maximum value allowed for radius predicted by RSS model
+
+**nsim** = how many simulations to do
+
+**exp_predictions** = if your RSS model has a log transformed response then this can be left as TRUE to result in predictions returned on the original scale (meters). If your RSS model uses distance on the original scale then set this as FALSE. 
+
+```{r}
+newPoints<-MakeNewPoint(X = 1000, 
+                        Y = 1000, 
+                        YagiMod = YagiMod, 
+                        WhipMod = WhipMod,
+                        ANT = "Whip", 
+                        RSS = 100, 
+                        maxR = 1000,
+                        nsim = 1000, 
+                        exp_predictions = TRUE)
+plot(newPoints$X, newPoints$Y, pch = 19, cex = .5, main = "RSS 100 - Whip",
+     xlab = "UTM X position", ylab = "UTM Y position")
+points(1000, 1000,cex = 4, col = "red",pch = 19)
+legend("topleft", pch=c(19,19), cex = c(1,1), col = c("black", "red"),
+       legend = c("simulated points", "estimated point"))
+
+
+newPoints<-MakeNewPoint(X = 1000, Y = 1000, YagiMod = YagiMod, WhipMod = WhipMod,ANT = "Whip", RSS = 60, maxR = 1000,
+             nsim = 1000, exp_predictions = TRUE)
+plot(newPoints$X, newPoints$Y, pch = 19, cex = .5, main = "RSS = 60 - Whip",
+     xlab = "UTM X position", ylab = "UTM Y position")
+points(1000, 1000,cex = 4, col = "red",pch = 19)
+legend("topleft", pch=c(19,19), cex = c(1,1), col = c("black", "red"),
+       legend = c("simulated points", "estimated point"))
+
+newPoints<-MakeNewPoint(X = 1000, Y = 1000, YagiMod = YagiMod, WhipMod = WhipMod,ANT = "Yagi", RSS = 150, maxR = 1000,
+             nsim = 1000, exp_predictions = TRUE)
+plot(newPoints$X, newPoints$Y, pch = 19, cex = .5, main = "RSS = 150 - Yagi",xlab = "UTM X position", ylab = "UTM Y position")
+points(1000, 1000,cex = 4, col = "red",pch = 19)
+legend("topleft", pch=c(19,19), cex = c(1,1), col = c("black", "red"),
+       legend = c("simulated points", "estimated point"))
+```
+
+
+## Demonstrate the Monte Carlo approach to determine confidence in movement and directionality (US,DS)
+
+The first function MakeNewPoint() generates many possible locations. The following function now considers two estimated fish locations (A, B) , and generates many possible locations for each of these. Lets call the first 'new' pair of simulated points *New A* and *New B* for this discussion.
+
+We can snap *New A* and *New B* to a river network (i.e., assume the fish is in the river and put the point to the closest location on the river). We now have two possible locations the fish *could have been* given all the uncertainty in the telemetry data. 
+
+Using these two new points we ask (1) did the fish go upstream or downstream and then (2) how far did it travel along the river. This process is repeated nsim times and results are summarized to a MC p value, movement distance (mean), and movement distance standard deviation. Movement distances are reported in two ways (1) downstream distances are considered negative numbers (i.e., -100 is a 100 meter move downstream) and results provided in the function show the mean and standard deviation of movement distances on their original scale (some positive, some negative) and (2) the function also  takes the abosulte value of each movement and then provides the mean and sd.  
+
+
+The function moveMC() takes the following inputs:
+
+**X1** = X coordinate point 1
+
+**X2** = X coordinate point 2 
+
+**Y1** = Y coordinate point 1
+
+**Y2** = Y coordinate point 2
+
+**RSS1** = RSS of point 1
+
+**RSS2** = RSS of point 2
+
+**ANT1** = Antenna used for point 1
+
+**ANT2** = Antenna used for point 2
+
+**YagiMod** = RSS model name for the yagi antenna
+
+**WhipMod** = RSS model name for the whip antenna
+
+**nsim** = Number of simulations to do 
+
+**maxR** = Maximum allowable radius for simulations
+
+**exp_predictions** = Should the results of model be exponentiated to achive units in meters?
+               
+               
+The p values reported (i.e., US_p) represent the proportion of simulations where an outcome (movement UP/ movement Down) was not observed. In other words, if US_p is 0.05 then in 95% of simulations the fish moved upstream. It is like a p value for a test of movement directionality. 
+
+
+```{r}
+moveMC(X1 = df$UTM_X[1],
+      X2 = df$UTM_X[2],
+      Y1 = df$UTM_Y[1],
+      Y2 = df$UTM_Y[2],
+      RSS1 = df$Power[1], 
+      RSS2 = df$Power[2], #The RSS values of the points
+      ANT1 = df$Antenna[1],
+      ANT2 = df$Antenna[2], #The antennas used for the poitns
+      YagiMod = YagiMod, 
+      WhipMod = WhipMod, #RSS models
+      nsim= 10000, #Number of simulations to do
+      maxR = 10000, #max allowed value for radius
+      exp_predictions = TRUE) #should
+
+```
+
+## Loop it and do for all consecutive points in this data frame
+
+Lets do it for all the sequential detections now, using the function and a loop. 
+
+```{r}
+#Run it for first pair of points and save as data frame
+moveMC_result<-moveMC(X1 = df$UTM_X[1],
+      X2 = df$UTM_X[2],
+      Y1 = df$UTM_Y[1],
+      Y2 = df$UTM_Y[2],
+      RSS1 = df$Power[1], 
+      RSS2 = df$Power[2], #The RSS values of the points
+      ANT1 = df$Antenna[1],
+      ANT2 = df$Antenna[2], #The antennas used for the poitns
+      YagiMod = YagiMod, 
+      WhipMod = WhipMod, #RSS models
+      nsim= 1000, #Number of simulations to do
+      maxR = 600, #max allowed value for radius
+      exp_predictions = TRUE) #should
+
+for(i in 2: (nrow(df)-1)){
+moveMC_result_new<-moveMC(X1 = df$UTM_X[i],
+      X2 = df$UTM_X[i+1],
+      Y1 = df$UTM_Y[i],
+      Y2 = df$UTM_Y[i+1],
+      RSS1 = df$Power[i], 
+      RSS2 = df$Power[i+1], #The RSS values of the points
+      ANT1 = df$Antenna[i],
+      ANT2 = df$Antenna[i+1], #The antennas used for the poitns
+      YagiMod = YagiMod, 
+      WhipMod = WhipMod, #RSS models
+      nsim= 1000, #Number of simulations to do
+      maxR = 600, #max allowed value for radius
+      exp_predictions = TRUE) #should
+moveMC_result<-rbind(moveMC_result, moveMC_result_new)
+
+}
+
+moveMC_result
+
+```
+
+
+
